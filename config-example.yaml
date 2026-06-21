@@ -1,0 +1,21 @@
+# InciWeb Tidbyt — local configuration.
+# Copy to config.yaml and fill in your values. config.yaml is gitignored.
+
+# Tidbyt API token — from `pixlet auth` or your Tidbyt account page.
+tidbyt_api_key: "YOUR-TIDBYT-KEY-HERE"
+
+# Tidbyt device ID — from `pixlet devices` or the mobile app's settings.
+tidbyt_device_id: "YOUR-DEVICE-ID"
+
+# Installation ID — alphanumeric only (a-z, A-Z, 0-9), per Tidbyt's API.
+tidbyt_installation_id: "inciweb"
+
+# Reference location for the wildfire search (decimal degrees).
+# Default: 766 S Martin St, Longmont, CO (same point as the AQ app).
+latitude:  "40.147796"
+longitude: "-105.088271"
+
+# Search radius in kilometers. 200 km covers the Front Range + adjacent
+# plains and foothills (Cameron Peak / East Troublesome reached us in
+# the 2020 fire season at ~80 km).
+radius_km: "200"
