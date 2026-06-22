@@ -57,6 +57,38 @@ COMPASS_16 = [
     "W", "WNW", "NW", "NNW",
 ]
 
+# Right panel alternates between the info screen and the centroid map.
+# Pixlet renders Animation children at 20 fps (50 ms each), so these are
+# dwell times in 50 ms units. ~8 s/cycle fits comfortably inside Tidbyt's
+# ~15 s app slot, and 5 s of info time lets the name marquee scroll a
+# typical wildfire name end-to-end.
+INFO_FRAMES = 100
+MAP_FRAMES = 60
+
+# Centroid map sized to the right panel. The crosshair marks the
+# configured location; pixel scale is radius_km / MAP_HALF_PX (~13 km/px
+# at the 200 km default), so fires that land on the same cell collide and
+# the larger one wins.
+MAP_W = 36
+MAP_H = 32
+MAP_CX = 17
+MAP_CY = 15
+MAP_HALF_PX = 15
+CROSSHAIR_COLOR = "#006688"
+
+# NWCG size classes A-G folded to 6 colors: A+B (<10 ac) share one dim
+# swatch since they sit below the smoke-impact threshold at this zoom;
+# C-G get distinct punchy colors. The index doubles as the bigger-wins
+# rank used to resolve pixel collisions.
+SIZE_CLASS_COLORS = [
+    "#555555",  # 0: <10 ac      (A/B)
+    "#FFFF00",  # 1: C 10-99 ac
+    "#FFAA00",  # 2: D 100-299 ac
+    "#FF6600",  # 3: E 300-999 ac
+    "#FF0000",  # 4: F 1k-5k ac
+    "#FF00FF",  # 5: G 5k+ ac     megafire
+]
+
 def fetch_fires(lat, lon, radius_km):
     if lat == None or lon == None:
         return None
@@ -335,6 +367,79 @@ def _clear_right_col(total_fires):
         ),
     )
 
+def _round_signed(v):
+    # int(x + 0.5) rounds positives correctly but truncates negatives
+    # toward zero in Starlark, which skews south/west projections.
+    if v >= 0:
+        return int(v + 0.5)
+    return -int(-v + 0.5)
+
+def _size_class_idx(acres):
+    """NWCG-style size-class rank (0..5), with A+B (<10 ac) merged."""
+    if acres == None or acres < 10:
+        return 0
+    if acres < 100:
+        return 1
+    if acres < 300:
+        return 2
+    if acres < 1000:
+        return 3
+    if acres < 5000:
+        return 4
+    return 5
+
+def _project(flat, flon, ref_lat, ref_lon, km_per_px):
+    """Equirectangular projection. At <=300 km it differs from great-
+    circle by well under one pixel, so the simple form is fine."""
+    lat_rad = ref_lat * math.pi / 180.0
+    dx_km = (flon - ref_lon) * 111.32 * math.cos(lat_rad)
+    dy_km = (flat - ref_lat) * 110.574
+    return (
+        MAP_CX + _round_signed(dx_km / km_per_px),
+        MAP_CY - _round_signed(dy_km / km_per_px),
+    )
+
+def _map_right_col(fires, ref_lat, ref_lon, radius_km):
+    """Right-panel map: black background, dim cyan crosshair at the
+    configured location, one pixel per fire centroid colored by NWCG
+    size class. On pixel collisions the larger fire wins; the crosshair
+    yields to fire pixels at the same cell."""
+    km_per_px = float(radius_km) / float(MAP_HALF_PX)
+
+    cells = {}
+    for f in fires:
+        px, py = _project(f["lat"], f["lon"], ref_lat, ref_lon, km_per_px)
+        if px < 0 or px >= MAP_W or py < 0 or py >= MAP_H:
+            continue
+        cls = _size_class_idx(f["size"])
+        key = (px, py)
+        if key not in cells or cls > cells[key]:
+            cells[key] = cls
+
+    children = []
+    for arm in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)]:
+        cxp = MAP_CX + arm[0]
+        cyp = MAP_CY + arm[1]
+        if (cxp, cyp) in cells:
+            continue
+        children.append(render.Padding(
+            pad = (cxp, cyp, 0, 0),
+            child = render.Box(width = 1, height = 1, color = CROSSHAIR_COLOR),
+        ))
+
+    for key, cls in cells.items():
+        children.append(render.Padding(
+            pad = (key[0], key[1], 0, 0),
+            child = render.Box(width = 1, height = 1, color = SIZE_CLASS_COLORS[cls]),
+        ))
+
+    return render.Box(
+        width = MAP_W,
+        height = MAP_H,
+        color = "#000000",
+        child = render.Stack(children = children),
+    )
+
 def _error_view(msg):
     return render.Root(
         child = render.Box(
@@ -374,19 +479,27 @@ def main(config):
 
     if len(upwind) == 0:
         big = _big_tile(0, wind_compass, GREEN_BG, FG_BLACK)
-        right_col = _clear_right_col(len(all_fires))
+        info_col = _clear_right_col(len(all_fires))
     else:
         nearest = upwind[0]
         bg, fg = _threat(nearest)
         big = _big_tile(len(upwind), wind_compass, bg, fg)
-        right_col = _fire_right_col(nearest)
+        info_col = _fire_right_col(nearest)
+
+    # Right panel cycles info -> map. Box-wrapping the info column gives
+    # Animation a definite frame size to match the map view.
+    info_view = render.Box(width = MAP_W, height = MAP_H, child = info_col)
+    map_view = _map_right_col(all_fires, lat, lon, radius)
+    right_anim = render.Animation(
+        children = [info_view] * INFO_FRAMES + [map_view] * MAP_FRAMES,
+    )
 
     return render.Root(
         child = render.Box(
             color = "#000000",
             child = render.Row(
                 expanded = True,
-                children = [big, right_col],
+                children = [big, right_anim],
             ),
         ),
     )
