@@ -1,11 +1,12 @@
-"""Wildfire incidents near a configured location, for Tidbyt.
+"""Nearest upwind wildfire for Tidbyt.
 
-Sources active US wildfire incidents from NIFC's WFIGS_Incident_Locations_Current
-ArcGIS feature service. The legacy InciWeb API the project is named after went
-404 — WFIGS is the authoritative replacement.
+Fetches active US wildfires from NIFC's WFIGS feature service and current
+wind direction from Open-Meteo. Filters to fires within ±45° of the wind's
+source direction (the windward sector) and shows the nearest one — the
+fire most likely to send smoke and ash this way.
 
-See ./design-notes.md for layout choices, threat-level thresholds, and the
-ArcGIS field map.
+See ./design-notes.md for the upwind-only design rationale, ArcGIS schema,
+and threat-level thresholds.
 """
 
 load("render.star", "render")
@@ -14,62 +15,83 @@ load("encoding/json.star", "json")
 load("schema.star", "schema")
 load("math.star", "math")
 
-# NIFC WFIGS — active US wildfire incidents. ArcGIS feature service.
 WFIGS_URL = (
     "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/" +
     "WFIGS_Incident_Locations_Current/FeatureServer/0/query"
 )
-FETCH_TTL_S = 600  # 10 min — WFIGS refreshes every few minutes during active incidents
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
-# Threat thresholds. Hardcoded; documented in design-notes.md.
-DANGER_DISTANCE_KM = 50      # close enough to consider evacuation routes
-CAUTION_DISTANCE_KM = 100    # close enough for smoke + ash awareness
-LARGE_FIRE_ACRES = 500       # "large" for threat-color escalation
+WFIGS_TTL_S = 600     # 10 min
+WIND_TTL_S = 1800     # 30 min — wind doesn't change minute-to-minute
 
-# AQI-style palette, matches the sibling AQ / Tor apps.
+# Threat-level thresholds for the *single nearest upwind fire*.
+DANGER_DISTANCE_KM = 50
+CAUTION_DISTANCE_KM = 100
+LARGE_FIRE_ACRES = 500
+
+# Upwind tolerance is *distance-dependent* — close fires need to be tightly
+# aligned with the wind to send smoke our way (plumes are still concentrated);
+# distant fires have had time to disperse laterally so a wider angular sector
+# can still hit us. Simple linear model: base degrees at 0 km, growing by
+# `_GROWTH_PER_KM` per km of distance, capped at `_MAX_DEG`.
+#
+# At the defaults:
+#     0 km →  20°       100 km → 35°        300 km → 65°
+#    50 km →  27.5°     200 km → 50°        500 km → 90° (capped)
+UPWIND_TOLERANCE_BASE_DEG = 20.0
+UPWIND_TOLERANCE_GROWTH_PER_KM = 0.15
+UPWIND_TOLERANCE_MAX_DEG = 90.0
+
 GREEN_BG = "#00E400"
 YELLOW_BG = "#FFFF00"
 ORANGE_BG = "#FF7E00"
 DARK_RED_BG = "#7E0023"
-GREEN_DOT = "#00C800"
-YELLOW_DOT = "#FFEE00"
-ORANGE_DOT = "#FF7E00"
-RED_DOT = "#FF0000"
 FG_BLACK = "#000000"
 FG_WHITE = "#FFFFFF"
+LABEL_COLOR = "#000080"  # navy — same accent used by the Tor app
 
-# Dark-navy accent (same constant used in the Tor relay app for the family
-# label). Only the B channel — maximally distinct from the warm category
-# backgrounds (G / Y / O / DR).
-LABEL_COLOR = "#000080"
+COMPASS_16 = [
+    "N", "NNE", "NE", "ENE",
+    "E", "ESE", "SE", "SSE",
+    "S", "SSW", "SW", "WSW",
+    "W", "WNW", "NW", "NNW",
+]
 
 def fetch_fires(lat, lon, radius_km):
-    """Fetch active US wildfires within radius_km of (lat, lon).
-    Returns a list of WFIGS feature dicts, or None on transport error."""
     if lat == None or lon == None:
         return None
     params = (
         "geometry=" + str(lon) + "," + str(lat) +
-        "&geometryType=esriGeometryPoint" +
-        "&inSR=4326" +
+        "&geometryType=esriGeometryPoint&inSR=4326" +
         "&distance=" + str(radius_km) +
         "&units=esriSRUnit_Kilometer" +
         "&where=IncidentTypeCategory%3D%27WF%27" +
-        "&outFields=IncidentName,FireDiscoveryDateTime,IncidentSize,PercentContained,POOState,POOCounty" +
-        "&returnGeometry=true" +
-        "&f=json" +
-        "&resultRecordCount=50" +
+        "&outFields=IncidentName,IncidentSize,PercentContained,POOState,POOCounty" +
+        "&returnGeometry=true&f=json&resultRecordCount=100" +
         "&orderByFields=IncidentSize+DESC"
     )
-    url = WFIGS_URL + "?" + params
-    r = http.get(url, ttl_seconds = FETCH_TTL_S)
+    r = http.get(WFIGS_URL + "?" + params, ttl_seconds = WFIGS_TTL_S)
+    if r.status_code != 200:
+        return None
+    return (r.json() or {}).get("features", [])
+
+def fetch_wind(lat, lon):
+    """Returns wind_direction_deg (the direction the wind is coming FROM,
+    Open-Meteo's convention; 0=N, 90=E, 180=S, 270=W) or None on error."""
+    url = (
+        OPEN_METEO_URL +
+        "?latitude=" + str(lat) +
+        "&longitude=" + str(lon) +
+        "&current=wind_direction_10m,wind_speed_10m"
+    )
+    r = http.get(url, ttl_seconds = WIND_TTL_S)
     if r.status_code != 200:
         return None
     body = r.json() or {}
-    return body.get("features", [])
+    cur = body.get("current") or {}
+    return cur.get("wind_direction_10m")
 
 def _haversine_km(lat1, lon1, lat2, lon2):
-    """Great-circle distance in km. math module gives sin/cos/asin/sqrt/pi."""
     R = 6371.0
     rad = math.pi / 180.0
     la1 = lat1 * rad
@@ -79,8 +101,41 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     h = sdla * sdla + math.cos(la1) * math.cos(la2) * sdlo * sdlo
     return 2 * R * math.asin(math.sqrt(h))
 
+def _bearing_deg(lat1, lon1, lat2, lon2):
+    """Initial compass bearing from (lat1,lon1) to (lat2,lon2). 0=N, 90=E."""
+    rad = math.pi / 180.0
+    la1 = lat1 * rad
+    la2 = lat2 * rad
+    dlo = (lon2 - lon1) * rad
+    y = math.sin(dlo) * math.cos(la2)
+    x = math.cos(la1) * math.sin(la2) - math.sin(la1) * math.cos(la2) * math.cos(dlo)
+    b = math.atan2(y, x) / rad
+    if b < 0:
+        b = b + 360
+    return b
+
+def _angular_diff(a, b):
+    """Smallest absolute angular distance between two compass bearings (0..180)."""
+    d = a - b
+    # Reduce to [-180, 180]
+    for _ in range(4):
+        if d > 180:
+            d = d - 360
+        elif d < -180:
+            d = d + 360
+        else:
+            break
+    if d < 0:
+        d = -d
+    return d
+
+def _compass(degrees):
+    if degrees == None:
+        return "?"
+    idx = int((degrees + 11.25) / 22.5) % 16
+    return COMPASS_16[idx]
+
 def _enrich(features, ref_lat, ref_lon):
-    """Drop features missing geometry, attach computed distance, sort by it."""
     out = []
     for f in features:
         attrs = f.get("attributes") or {}
@@ -98,59 +153,42 @@ def _enrich(features, ref_lat, ref_lon):
             "lat": flat,
             "lon": flon,
             "dist_km": _haversine_km(ref_lat, ref_lon, flat, flon),
+            "bearing_deg": _bearing_deg(ref_lat, ref_lon, flat, flon),
         })
+    return out
+
+def _upwind_tolerance_deg(distance_km):
+    """Distance-dependent windward-sector half-angle. See module-level
+    constants and design-notes.md for the model."""
+    t = UPWIND_TOLERANCE_BASE_DEG + distance_km * UPWIND_TOLERANCE_GROWTH_PER_KM
+    if t > UPWIND_TOLERANCE_MAX_DEG:
+        return UPWIND_TOLERANCE_MAX_DEG
+    return t
+
+def _filter_upwind(fires, wind_from_deg):
+    """A fire is roughly upwind if its bearing from us is within the
+    distance-dependent windward-sector half-angle of the wind's source
+    direction. Returns sorted by ascending distance."""
+    out = []
+    for f in fires:
+        if _angular_diff(f["bearing_deg"], wind_from_deg) <= _upwind_tolerance_deg(f["dist_km"]):
+            out.append(f)
     return sorted(out, key = lambda x: x["dist_km"])
 
-def _threat(fires):
-    """Background+foreground for the count tile based on the worst threat
-    present. Green if zero. Yellow for any active in range. Orange when at
-    least one is within CAUTION_DISTANCE_KM and <75% contained. Dark red
-    when at least one is within DANGER_DISTANCE_KM, <50% contained, and
-    larger than LARGE_FIRE_ACRES."""
-    if len(fires) == 0:
-        return GREEN_BG, FG_BLACK
-    has_danger = False
-    has_caution = False
-    for f in fires:
-        contained = f.get("contained") or 0
-        size = f.get("size") or 0
-        dist = f.get("dist_km") or 0
-        if dist <= DANGER_DISTANCE_KM and contained < 50 and size >= LARGE_FIRE_ACRES:
-            has_danger = True
-        if dist <= CAUTION_DISTANCE_KM and contained < 75:
-            has_caution = True
-    if has_danger:
+def _threat(fire):
+    contained = fire.get("contained") or 0
+    size = fire.get("size") or 0
+    dist = fire.get("dist_km") or 0
+    if dist <= DANGER_DISTANCE_KM and contained < 50 and size >= LARGE_FIRE_ACRES:
         return DARK_RED_BG, FG_WHITE
-    if has_caution:
+    if dist <= CAUTION_DISTANCE_KM and contained < 75:
         return ORANGE_BG, FG_BLACK
     return YELLOW_BG, FG_BLACK
 
-def _fire_dot_color(fire):
-    contained = fire.get("contained")
-    if contained == None:
-        return RED_DOT  # missing data — assume worst
-    if contained >= 100:
-        return GREEN_DOT
-    if contained >= 50:
-        return YELLOW_DOT
-    if contained >= 1:
-        return ORANGE_DOT
-    return RED_DOT
-
-def _format_dist(dist_km):
-    if dist_km == None:
-        return "—"
-    if dist_km < 1000:
-        return str(int(dist_km + 0.5)) + "km"
-    # 4-digit km values get a 'k' suffix on the km, e.g., 1290 → 1.3Mm (rare)
-    return str(int(dist_km / 100 + 0.5) * 100) + "km"
-
 def _format_acres(ac):
-    """Compact acres: '500', '15k', '642k', '1.2M'."""
     if ac == None or ac <= 0:
         return "0"
     if ac >= 1000000:
-        # X.X M
         v = int(ac / 100000 + 0.5)
         whole = v // 10
         frac = v - whole * 10
@@ -159,34 +197,78 @@ def _format_acres(ac):
         return str(int(ac / 1000 + 0.5)) + "k"
     return str(int(ac + 0.5))
 
-def _kv_row(label, value, value_color = "#FFFFFF"):
+def _format_pct(p):
+    """Just the integer portion. The '%' glyph is rendered as a separate
+    Text widget in the row (see `_compass_pct_row`) so any subtle font /
+    width / clipping issue at the column edge can't drop it.
+    Missing data renders as '-' (hyphen) rather than '?' — tom-thumb's
+    '?' glyph reads like a '7' at LED-matrix resolution."""
+    if p == None:
+        return "-"
+    return str(int(p + 0.5))
+
+def _compass_pct_row(compass, contained_value):
+    """Compass on the left in tb-8 (wider, clearer N/W/E/S glyphs than
+    tom-thumb's tight 4x6), integer containment + standalone '%' glyph on
+    the right in tom-thumb (the column is too narrow for the full row to
+    use tb-8). Mixed font heights — the row is 8 px tall, the others stay
+    at 6 px — but vertical centering hides the mismatch."""
+    return render.Row(
+        expanded = True,
+        main_align = "space_between",
+        cross_align = "center",
+        children = [
+            render.Text(compass, color = FG_WHITE, font = "tb-8"),
+            render.Row(
+                cross_align = "center",
+                children = [
+                    render.Text(contained_value, color = FG_WHITE, font = "tom-thumb"),
+                    render.Text("%", color = FG_WHITE, font = "tom-thumb"),
+                ],
+            ),
+        ],
+    )
+
+def _kv_row(label, value):
     return render.Row(
         expanded = True,
         main_align = "space_between",
         cross_align = "center",
         children = [
             render.Text(label, color = FG_WHITE, font = "tom-thumb"),
-            render.Text(value, color = value_color, font = "tom-thumb"),
+            render.Text(value, color = FG_WHITE, font = "tom-thumb"),
         ],
     )
 
-def _dots_row(fires):
-    """One 4x4 colored square per fire, 1px gap. Up to 7 fit in 36 px; a
-    '+' caps any overflow."""
-    children = []
-    cap = 7
-    for f in fires[:cap]:
-        children.append(render.Padding(
-            pad = (0, 0, 1, 0),
-            child = render.Box(width = 4, height = 4, color = _fire_dot_color(f)),
-        ))
-    if len(fires) > cap:
-        children.append(render.Text("+", color = FG_WHITE, font = "tom-thumb"))
-    return render.Row(cross_align = "center", children = children)
+def _name_row(name):
+    """Fire name across the full right-column width. Marquee scrolls if the
+    name overflows; static otherwise. Color is the navy accent so the name
+    reads as a header rather than another data row."""
+    return render.Marquee(
+        width = 32,
+        child = render.Text(name, color = LABEL_COLOR, font = "tom-thumb"),
+    )
 
-def _big_tile(count, bg, fg):
-    """Left tile: small 'FIRES' label in navy on top, big count below in
-    the category foreground."""
+def _fire_icon():
+    """Stylized pixel flame, 5 px wide × 7 px tall. Same flame the sibling
+    AQ Tidbyt app uses for its smoke badge — keeps the visual vocabulary
+    consistent across this user's devices."""
+    return render.Column(
+        cross_align = "center",
+        children = [
+            render.Box(width = 1, height = 1, color = "#FFEE00"),
+            render.Box(width = 3, height = 1, color = "#FFAA00"),
+            render.Box(width = 3, height = 1, color = "#FF7700"),
+            render.Box(width = 5, height = 1, color = "#FF4400"),
+            render.Box(width = 5, height = 2, color = "#FF1100"),
+            render.Box(width = 3, height = 1, color = "#AA0000"),
+        ],
+    )
+
+def _big_tile(count, wind_compass, bg, fg):
+    """Left tile: upwind fire count in 6x13 with a pixel-art flame icon
+    appended, wind source compass at the local site in tb-8 below.
+    Background colored by threat level (green when count==0)."""
     return render.Box(
         width = 28,
         height = 32,
@@ -196,8 +278,59 @@ def _big_tile(count, bg, fg):
             main_align = "space_evenly",
             cross_align = "center",
             children = [
-                render.Text("FIRES", color = LABEL_COLOR, font = "tb-8"),
-                render.Text(str(count), color = fg, font = "6x13"),
+                render.Row(
+                    cross_align = "center",
+                    children = [
+                        render.Text(str(count), color = fg, font = "6x13"),
+                        render.Padding(pad = (2, 0, 0, 0), child = _fire_icon()),
+                    ],
+                ),
+                render.Text(wind_compass, color = fg, font = "6x13"),
+            ],
+        ),
+    )
+
+def _right_text(text, color = FG_WHITE):
+    """Single value, right-justified within the column width."""
+    return render.Row(
+        expanded = True,
+        main_align = "end",
+        children = [render.Text(text, color = color, font = "tom-thumb")],
+    )
+
+def _fire_right_col(fire):
+    """Right column when an upwind fire is present: name (marquee) / acres
+    right-justified / fire-compass left + containment % right / distance
+    right-justified."""
+    fire_compass = _compass(fire["bearing_deg"])
+    return render.Padding(
+        pad = (2, 0, 2, 0),
+        child = render.Column(
+            expanded = True,
+            main_align = "space_evenly",
+            children = [
+                _name_row(fire["name"]),
+                _right_text(_format_acres(fire["size"]) + " ac"),
+                _compass_pct_row(fire_compass, _format_pct(fire["contained"])),
+                _right_text(str(int(fire["dist_km"] + 0.5)) + "km"),
+            ],
+        ),
+    )
+
+def _clear_right_col(total_fires):
+    """Right column when nothing upwind. Quiet 'ALL CLEAR' with a small
+    parenthetical noting the total fires in range (which might still be
+    nonzero — they just aren't sending smoke this way)."""
+    return render.Padding(
+        pad = (2, 0, 2, 0),
+        child = render.Column(
+            expanded = True,
+            main_align = "center",
+            cross_align = "center",
+            children = [
+                render.Text("ALL", color = FG_WHITE, font = "tb-8"),
+                render.Text("CLEAR", color = FG_WHITE, font = "tb-8"),
+                render.Text("(" + str(total_fires) + " in range)", color = "#888888", font = "tom-thumb"),
             ],
         ),
     )
@@ -216,8 +349,8 @@ def _error_view(msg):
     )
 
 def main(config):
-    lat_s = config.get("latitude", "40.147796")
-    lon_s = config.get("longitude", "-105.088271")
+    lat_s = config.get("latitude", "")
+    lon_s = config.get("longitude", "")
     radius_s = config.get("radius_km", "200")
 
     if not lat_s or not lon_s:
@@ -231,50 +364,29 @@ def main(config):
     if feats == None:
         return _error_view("WFIGS ERR")
 
-    fires = _enrich(feats, lat, lon)
-    bg, fg = _threat(fires)
+    wind_dir = fetch_wind(lat, lon)
+    if wind_dir == None:
+        return _error_view("WIND ERR")
 
-    if len(fires) == 0:
-        right_col = render.Padding(
-            pad = (2, 0, 0, 0),
-            child = render.Column(
-                expanded = True,
-                main_align = "space_evenly",
-                children = [
-                    _kv_row("NEAR", "—"),
-                    _kv_row("MAX", "0"),
-                    render.Text(str(radius) + "km", color = "#888888", font = "tom-thumb"),
-                ],
-            ),
-        )
+    all_fires = _enrich(feats, lat, lon)
+    upwind = _filter_upwind(all_fires, wind_dir)
+    wind_compass = _compass(wind_dir)
+
+    if len(upwind) == 0:
+        big = _big_tile(0, wind_compass, GREEN_BG, FG_BLACK)
+        right_col = _clear_right_col(len(all_fires))
     else:
-        closest = fires[0]
-        largest = fires[0]
-        for f in fires:
-            if (f.get("size") or 0) > (largest.get("size") or 0):
-                largest = f
-        right_col = render.Padding(
-            pad = (2, 0, 0, 0),
-            child = render.Column(
-                expanded = True,
-                main_align = "space_evenly",
-                children = [
-                    _kv_row("NEAR", _format_dist(closest["dist_km"])),
-                    _kv_row("MAX", _format_acres(largest["size"])),
-                    _dots_row(fires),
-                ],
-            ),
-        )
+        nearest = upwind[0]
+        bg, fg = _threat(nearest)
+        big = _big_tile(len(upwind), wind_compass, bg, fg)
+        right_col = _fire_right_col(nearest)
 
     return render.Root(
         child = render.Box(
             color = "#000000",
             child = render.Row(
                 expanded = True,
-                children = [
-                    _big_tile(len(fires), bg, fg),
-                    right_col,
-                ],
+                children = [big, right_col],
             ),
         ),
     )

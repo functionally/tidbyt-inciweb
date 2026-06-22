@@ -24,8 +24,30 @@ red()   { printf "\033[31m%s\033[0m" "$1"; }
 ok()    { printf "  $(green '✓') %s\n" "$1"; }
 warn()  { printf "  $(red '✗') %s\n" "$1"; }
 
+echo "== Wind direction at (${LAT}, ${LON}) — Open-Meteo =="
+WIND_URL="https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}&current=wind_direction_10m,wind_speed_10m"
+WIND_RESP=$(curl -sL --max-time 12 -w "\n%{http_code}" "$WIND_URL")
+WIND_CODE=$(printf '%s' "$WIND_RESP" | tail -n1)
+WIND_BODY=$(printf '%s' "$WIND_RESP" | sed '$d')
+
+if [[ "$WIND_CODE" != "200" ]]; then
+  warn "Open-Meteo returned HTTP $WIND_CODE"
+  exit 1
+fi
+ok "Open-Meteo OK"
+
+WIND_DEG=$(python3 -c "import json; d=json.loads('''${WIND_BODY}'''); print(d['current']['wind_direction_10m'])")
+WIND_SPEED=$(python3 -c "import json; d=json.loads('''${WIND_BODY}'''); print(d['current']['wind_speed_10m'])")
+WIND_COMPASS=$(python3 -c "
+deg = ${WIND_DEG}
+labels = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW']
+print(labels[int((deg + 11.25) / 22.5) % 16])
+")
+echo "  wind FROM ${WIND_COMPASS} (${WIND_DEG}°), ${WIND_SPEED} m/s"
+
+echo
 echo "== WFIGS — active US wildfires within ${RADIUS} km of (${LAT}, ${LON}) =="
-URL="https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Incident_Locations_Current/FeatureServer/0/query?geometry=${LON},${LAT}&geometryType=esriGeometryPoint&inSR=4326&distance=${RADIUS}&units=esriSRUnit_Kilometer&where=IncidentTypeCategory%3D%27WF%27&outFields=IncidentName,FireDiscoveryDateTime,IncidentSize,PercentContained,POOState,POOCounty&returnGeometry=true&f=json&resultRecordCount=50&orderByFields=IncidentSize+DESC"
+URL="https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Incident_Locations_Current/FeatureServer/0/query?geometry=${LON},${LAT}&geometryType=esriGeometryPoint&inSR=4326&distance=${RADIUS}&units=esriSRUnit_Kilometer&where=IncidentTypeCategory%3D%27WF%27&outFields=IncidentName,FireDiscoveryDateTime,IncidentSize,PercentContained,POOState,POOCounty&returnGeometry=true&f=json&resultRecordCount=100&orderByFields=IncidentSize+DESC"
 RESP=$(curl -sL --max-time 20 -w "\n%{http_code}" "$URL")
 CODE=$(printf '%s' "$RESP" | tail -n1)
 BODY=$(printf '%s' "$RESP" | sed '$d')
@@ -35,21 +57,43 @@ if [[ "$CODE" != "200" ]]; then
   exit 1
 fi
 
-ok "endpoint OK (HTTP 200)"
+ok "WFIGS OK"
 
 echo
 python3 - <<EOF
-import json, math, datetime as DT
+import json, math
 d = json.loads('''${BODY}''')
 feats = d.get("features", [])
 ref = (${LAT}, ${LON})
+wind_dir = ${WIND_DEG}
+
+# Distance-dependent windward-sector half-angle. Matches the model in
+# main.star (UPWIND_TOLERANCE_BASE_DEG=20, _GROWTH_PER_KM=0.15, _MAX=90).
+def tol(d):
+    t = 20 + d * 0.15
+    return 90 if t > 90 else t
+
 R = 6371.0
+LABELS = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW']
 def hav(a, b):
     la1, lo1 = math.radians(a[0]), math.radians(a[1])
     la2, lo2 = math.radians(b[0]), math.radians(b[1])
     dl = la2-la1; dn = lo2-lo1
     h = math.sin(dl/2)**2 + math.cos(la1)*math.cos(la2)*math.sin(dn/2)**2
     return 2*R*math.asin(math.sqrt(h))
+def bearing(a, b):
+    la1, lo1 = math.radians(a[0]), math.radians(a[1])
+    la2, lo2 = math.radians(b[0]), math.radians(b[1])
+    dlo = lo2 - lo1
+    y = math.sin(dlo) * math.cos(la2)
+    x = math.cos(la1)*math.sin(la2) - math.sin(la1)*math.cos(la2)*math.cos(dlo)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+def compass(deg):
+    return LABELS[int((deg + 11.25) / 22.5) % 16]
+def ang_diff(a, b):
+    d = (a - b) % 360
+    if d > 180: d = 360 - d
+    return d
 
 enriched = []
 for f in feats:
@@ -57,37 +101,50 @@ for f in feats:
     geom = f.get("geometry", {})
     lat = geom.get("y"); lon = geom.get("x")
     if lat is None or lon is None: continue
-    enriched.append({**attrs, "lat": lat, "lon": lon, "dist": hav(ref, (lat, lon))})
+    bg = bearing(ref, (lat, lon))
+    enriched.append({**attrs, "lat": lat, "lon": lon,
+                     "dist": hav(ref, (lat, lon)),
+                     "bearing": bg, "upwind_off": ang_diff(bg, wind_dir)})
 enriched.sort(key=lambda f: f["dist"])
 
 print(f"  {len(enriched)} active wildfires within ${RADIUS} km")
 if not enriched:
-    print(f"  \033[32mall clear — green tile\033[0m")
+    print(f"  \033[32mno fires in range — green CLEAR tile\033[0m")
 else:
     print()
-    print(f"  {'name':30s}  {'dist km':>8s}  {'acres':>10s}  {'cont':>5s}  state/county")
+    print(f"  {'name':28s}  {'dist km':>8s}  {'bearing':>7s}  {'Δwind':>6s}  {'tol':>5s}  {'acres':>10s}  {'cont':>5s}  upwind?")
+    upwind = []
     for f in enriched:
-        name = (f.get("IncidentName") or "?")[:30]
+        name = (f.get("IncidentName") or "?")[:28]
         size = f.get("IncidentSize") or 0
         cont = f.get("PercentContained")
         cont_s = f"{cont:.0f}%" if cont is not None else "—"
-        state = (f.get("POOState") or "")
-        county = (f.get("POOCounty") or "")
-        print(f"  {name:30s}  {f['dist']:>8.1f}  {size:>10,.0f}  {cont_s:>5s}  {state}/{county}")
+        bearing_lbl = compass(f["bearing"])
+        t_deg = tol(f["dist"])
+        is_upwind = f["upwind_off"] <= t_deg
+        up_mark = "\033[32m✓\033[0m" if is_upwind else " "
+        bearing_col = f"{bearing_lbl:>3s} {f['bearing']:>3.0f}"
+        tol_col = f"±{t_deg:>3.0f}°"
+        print(f"  {name:28s}  {f['dist']:>8.1f}  {bearing_col:>7s}  {f['upwind_off']:>5.0f}°  {tol_col:>5s}  {size:>10,.0f}  {cont_s:>5s}  {up_mark}")
+        if is_upwind:
+            upwind.append(f)
     print()
-    closest = enriched[0]
-    largest = max(enriched, key=lambda f: f.get("IncidentSize") or 0)
-    print(f"  closest: {closest.get('IncidentName')} @ {closest['dist']:.1f} km, {(closest.get('PercentContained') or 0):.0f}% contained")
-    print(f"  largest: {largest.get('IncidentName')} @ {(largest.get('IncidentSize') or 0):,.0f} ac")
-    # Mirror threat thresholds from main.star
-    danger = any(f["dist"] <= 50 and (f.get("PercentContained") or 0) < 50 and (f.get("IncidentSize") or 0) >= 500 for f in enriched)
-    caution = any(f["dist"] <= 100 and (f.get("PercentContained") or 0) < 75 for f in enriched)
-    if danger:
-        print(f"  \033[31m≥1 large uncontained fire within 50 km — DARK RED tile\033[0m")
-    elif caution:
-        print(f"  \033[33m≥1 fire within 100 km, <75% contained — ORANGE tile\033[0m")
+    if not upwind:
+        print(f"  \033[32mno fires within their distance-scaled windward sector — green CLEAR tile\033[0m")
     else:
-        print(f"  \033[33mactive fires in range but distant/contained — YELLOW tile\033[0m")
+        nearest = upwind[0]
+        cont = nearest.get("PercentContained") or 0
+        size = nearest.get("IncidentSize") or 0
+        dist = nearest["dist"]
+        threat = "YELLOW"
+        if dist <= 50 and cont < 50 and size >= 500:
+            threat = "\033[31mDARK RED\033[0m"
+        elif dist <= 100 and cont < 75:
+            threat = "\033[33mORANGE\033[0m"
+        else:
+            threat = "\033[33mYELLOW\033[0m"
+        print(f"  nearest upwind: \033[1m{nearest.get('IncidentName')}\033[0m  {compass(nearest['bearing'])} {dist:.0f} km  {size:,.0f} ac  {cont:.0f}% contained")
+        print(f"  → tile: {threat}")
 EOF
 
 echo

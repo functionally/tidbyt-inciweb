@@ -48,32 +48,63 @@ Notes on the fields:
 
 ## Layout
 
-64 × 32 RGB pixels. Same two-tile structure as the sibling apps.
+64 × 32 RGB pixels. Same two-tile structure as the sibling apps. The display is **upwind-only** — it shows the nearest fire whose bearing is within ±45° of where the wind is currently coming from. Fires downwind don't appear regardless of size or distance, because they aren't sending smoke this way.
+
+### Why upwind-only
+
+The earlier iteration showed every fire in range with a dot per fire. Spatial truth: at any given moment, almost all of those fires aren't relevant to *your* air. A 600 k acre contained fire 290 km downwind is interesting but irrelevant. A 5 k acre uncontained fire 80 km upwind is the one you care about.
+
+Filtering to the windward sector (±45° of the wind's source direction) cuts the display to "fires whose smoke is heading my way." Distance among those tells you how soon.
+
+### Layout — upwind fire present
 
 ```
 ┌────────────┬─────────────────────────────────┐
-│   FIRES    │ NEAR    287km                   │
-│            │ MAX     642k                    │
-│    3       │ ●●●                             │
+│            │ Morrill                         │
+│    3       │                       642k ac   │
+│            │ WNW                     100%    │
+│    W       │                        287km    │
 │ (color bg) │                                 │
 └────────────┴─────────────────────────────────┘
   28×32 left      34×32 right (incl. 2 px pad)
 ```
 
-### Big tile (28×32)
+- Big tile, top: number of *upwind* fires in `6x13` font, with a 5×7 pixel-art flame appended (same flame the sibling AQ app uses for its smoke badge — keeps the visual vocabulary consistent across devices). 2 px of horizontal padding between the count and the icon.
+- Big tile, bottom: wind source compass at the local site in `6x13` (was `tb-8`; switched up for cleaner N/W/E/S glyphs at LED resolution).
+- Background = threat color (green / yellow / orange / dark red).
+- Right column, 4 rows in `tom-thumb`:
+  1. Fire name in navy `#000080`, wrapped in `render.Marquee(width=32)` so long names scroll horizontally and short ones sit static.
+  2. Size right-justified, with `k` (kilo) or `M` (mega) magnitude prefix and an `ac` unit suffix (`999 ac`, `15k ac`, `642k ac`, `1.5M ac`).
+  3. Compass-to-the-fire on the left in `tb-8` (wider glyphs read more cleanly at this size than `tom-thumb`'s tight 4x6), containment % right-justified in `tom-thumb`. The row is 8 px tall — taller than the other rows, but the `tom-thumb` percent stays vertically centered within it via `cross_align="center"`.
+  4. Distance in km, right-justified, with `km` unit suffix.
 
-- **Top:** small `FIRES` label in navy `#000080`, `tb-8` font. Same color/font as the Tor relay app's family ID — a maximally-distinct cue against any of the warm tile backgrounds.
-- **Bottom:** active-fire count in `6x13`. 1–3-digit counts fit comfortably; high-fire-season counts like `27` look right.
-- Background color encodes the worst threat present (see thresholds below).
+Row 3 lays the fire's compass next to its containment so the reader sees *which direction this fire is in and how contained it is* on a single line. Combined with the wind compass on the big tile, the user can immediately verify the upwind filter is doing what it should — the row-3 compass should be within one or two 22.5° steps of the wind compass on the tile (within the distance-scaled sector).
+
+### Layout — clear (no upwind fires)
+
+```
+┌────────────┬─────────────────────────────────┐
+│            │                                 │
+│    0       │           ALL                   │
+│            │          CLEAR                  │
+│    W       │      (3 in range)               │
+│  (green)   │                                 │
+└────────────┴─────────────────────────────────┘
+```
+
+- Big tile keeps the same shape as the active case — `0` on top, wind compass on bottom, green background. That way the structure of the display doesn't visibly reshuffle when the threat clears, only the colors and right-column content change.
+- Right column shows `ALL CLEAR` and a small parenthetical with the total fires *in range* (regardless of bearing). The right column color shows you that the wind-filter is what gave you the all-clear, not necessarily a global quiet.
 
 ### Threat-level thresholds (and why)
 
+Thresholds apply to the **nearest upwind fire**, not the global worst.
+
 | Condition | Background | Color name |
 | --- | --- | --- |
-| 0 fires in range | `#00E400` green | "all clear" |
-| Active fires in range, but all distant or well-contained | `#FFFF00` yellow | "awareness" |
-| ≥1 fire within 100 km and < 75% contained | `#FF7E00` orange | "caution" |
-| ≥1 large (≥ 500 ac) uncontained (< 50%) fire within 50 km | `#7E0023` dark red | "danger" |
+| No upwind fires | `#00E400` green | "all clear" |
+| Upwind fire(s), but all distant or well-contained | `#FFFF00` yellow | "awareness" |
+| Nearest upwind fire within 100 km and < 75% contained | `#FF7E00` orange | "caution" |
+| Nearest upwind fire is large (≥ 500 ac), uncontained (< 50%), within 50 km | `#7E0023` dark red | "danger" |
 
 The numbers come from rough Front Range experience:
 
@@ -84,37 +115,79 @@ The numbers come from rough Front Range experience:
 
 These thresholds are constants in `main.star`. Tune for different geography.
 
-### Right column (34×32, incl. 2 px pad)
+### Right column (34×32, incl. 2 px pad) — content map
 
-Three rows in `tom-thumb`:
+In `tom-thumb`, distributed via `space_evenly`. (See diagrams above for the visual; this list keeps the data-to-row map explicit.)
 
-1. `NEAR` ⋯ distance to the closest fire (km).
-2. `MAX` ⋯ size of the largest fire in range, formatted with `k`/`M` suffix (`642k`, `1.2M`).
-3. Per-fire dots — one 4×4 colored box per fire, 1 px gap, capped at 7 with a `+` if more.
+When an upwind fire is present (4 rows):
 
-Per-dot color (containment):
+1. Fire name in navy `#000080`, marquee-wrapped.
+2. Size + `ac`, right-justified.
+3. Direction-to-fire (left) + containment % (right).
+4. Distance + `km`, right-justified.
 
-| Containment | Color | Hex |
-| --- | --- | --- |
-| 100% | green | `#00C800` |
-| ≥ 50% | yellow | `#FFEE00` |
-| 1–49% | orange | `#FF7E00` |
-| 0% / unknown | red | `#FF0000` |
+When clear (3 rows):
 
-### Why these specific numbers in the right column
+1. `ALL` in `tb-8`, centered.
+2. `CLEAR` in `tb-8`, centered.
+3. `(N in range)` in muted grey `#888888`, centered. `N` is the count of fires in range regardless of bearing.
 
-For a glanceable display, the two questions an operator-of-stuff cares about are:
+## Bearing and "roughly upwind" math
 
-- "How close?" (NEAR — distance to closest)
-- "How big?" (MAX — largest fire size)
+Wind direction at 10 m above ground (`wind_direction_10m`) is given in Open-Meteo's response as **the direction the wind is coming FROM**, in degrees. So:
 
-Total acres burning would be technically more correct but less actionable. A 600,000 acre contained fire in Nebraska doesn't matter to a Front Range resident; a 5,000 acre uncontained fire 30 km west does. Per-fire dots carry the containment context so the user can correlate.
+- `0°` = wind from the north (blowing south)
+- `90°` = wind from the east (blowing west)
+- `270°` = wind from the west (blowing east)
+
+A fire is "upwind" if its bearing from us is in the same direction as the wind's source — i.e., we look toward the fire by looking in the same direction the wind is coming from. The app uses a **distance-dependent** tolerance, not a fixed ±45°.
+
+### Plume widening — why tolerance grows with distance
+
+Physical fact: as a smoke plume travels downwind, it disperses laterally. Turbulent mixing, wind shear at boundaries between air masses, and atmospheric instability all spread the plume sideways over time and distance. So:
+
+- A fire 5 km upwind has a *concentrated* plume. For its smoke to reach me, the wind needs to be pointing very close to me. Tight tolerance.
+- A fire 500 km upwind has a *spread-out* plume that may be tens of km wide by the time it gets close. The wind can be 60–90° off the fire-to-me bearing and the plume still drifts onto my point. Wide tolerance.
+
+The app models this as a linear growth:
+
+```
+tolerance_deg(d) = clamp(BASE + GROWTH_PER_KM × d, 0, MAX)
+```
+
+with `BASE = 20°`, `GROWTH_PER_KM = 0.15°/km`, `MAX = 90°`. At the defaults:
+
+| Distance | Tolerance |
+| --- | --- |
+| 0 km | 20° |
+| 50 km | 27.5° |
+| 100 km | 35° |
+| 200 km | 50° |
+| 300 km | 65° |
+| 470 km | 90° (cap) |
+
+The exact numbers are a coarse approximation — real dispersion follows Gaussian-plume models that depend on atmospheric stability class. The linear form here errs toward "include more candidates" because under-counting upwind fires is the bigger usability failure (missing a fire that's actually hitting you with smoke is worse than incorrectly flagging one that isn't).
+
+Bearing from us to a fire is the standard great-circle initial bearing:
+
+```
+y = sin(Δλ) · cos(φ₂)
+x = cos(φ₁)·sin(φ₂) − sin(φ₁)·cos(φ₂)·cos(Δλ)
+θ = atan2(y, x)
+```
+
+where φ is latitude, λ is longitude.
+
+The Pixlet `math` module provides `pi`, `sin`, `cos`, `atan2`, `asin`, `sqrt` — enough for both haversine and bearing without external dependencies.
 
 ## Caching and cadence
 
-- HTTP cache: `http.get(url, ttl_seconds=600)`. WFIGS refreshes every few minutes during active incidents; 10 minutes is plenty for ambient awareness.
-- Push cadence: 10 minutes by default (`PUSH_INTERVAL_S=600`). During an active local event you could drop to 300 (5 min) for faster reaction; outside fire season the data barely changes.
-- WFIGS updates more often than once per hour, so we don't need the Tor-relay app's wall-clock-aligned schedule — a simple sleep loop is fine.
+Two upstream APIs, two cache windows:
+
+- WFIGS: `http.get(url, ttl_seconds=600)` — refreshes every few minutes during active incidents; 10 min is plenty.
+- Open-Meteo wind: `http.get(url, ttl_seconds=1800)` — surface wind doesn't change minute-to-minute; 30 min cache reduces upstream calls by 3× vs WFIGS without losing meaningful resolution.
+
+Push cadence: 10 minutes by default (`PUSH_INTERVAL_S=600`). During an active local event you could drop to 300 (5 min) for faster reaction; outside fire season the data barely changes. Wall-clock alignment isn't useful here since neither API has a fixed publication schedule.
 
 ## Starlark gotchas (carried from sibling projects)
 
@@ -124,8 +197,9 @@ Total acres burning would be technically more correct but less actionable. A 600
 
 ## Open questions / stretch ideas
 
-- **Wind direction overlay.** A fire is qualitatively more dangerous when it's upwind. NWS gridpoint forecast (`api.weather.gov/gridpoints/.../forecast`) has wind direction; could nudge the threat color one step warmer when an in-range fire is upwind.
-- **Acreage sparkline.** WFIGS exposes a history per incident — could render a small line chart showing whether the largest fire is growing or shrinking over the last 24 h. Tight at tom-thumb sizes.
-- **Smoke layer.** NOAA HMS smoke shapefiles overlay the actual smoke plume position. Could turn the tile yellow even with zero in-range fires if smoke is overhead.
+- **Acreage sparkline for the upwind fire.** WFIGS exposes a history per incident — could render a small line chart under the right column showing whether *that specific fire* is growing or shrinking over the last 24 h.
+- **Multi-level winds.** 10 m surface wind drives ground-level smoke; 700 mb / 500 mb winds steer the smoke plume aloft. The app uses surface only; on days with significant directional shear (chinook, frontal passage) upper-level smoke can come from a different direction than the surface wind suggests.
+- **Smoke layer overlay.** NOAA HMS produces smoke polygons. Could downgrade the tile to yellow even when no fires are upwind, if smoke is overhead from an out-of-region source.
+- **Wind speed as a signal.** Calm winds (< 2 m/s) mean smoke barely transports — the "upwind" filter is misleading because nothing is upwind in any meaningful sense. Could grey the tile under calm conditions.
 - **Multi-region support.** The threat thresholds are tuned for Front Range; an `imperial` flag could swap km for miles, but the geographic semantics are the harder part.
 - **Discord / ntfy alert hook.** When the tile flips green → orange, send a notification. Out of scope for the display itself.

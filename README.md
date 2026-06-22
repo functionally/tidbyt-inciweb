@@ -6,26 +6,41 @@ See [design-notes.md](./design-notes.md) for layout choices, threat thresholds, 
 
 ## What it shows
 
+The nearest active wildfire **that is roughly upwind** of the configured point — the fire most likely to send smoke and ash this way. "Roughly upwind" = bearing from your point within a *distance-dependent* windward sector of where the wind is currently coming from (close fires need tight alignment; distant fires get a wider sector because their plumes have had more lateral spread).
+
 ```
 ┌────────────┬──────────────────┐
-│   FIRES    │ NEAR  287km      │   distance to closest fire
-│            │ MAX    642k      │   largest fire size (acres, compact)
-│   3        │ ●●●              │   one colored 4×4 dot per fire
+│            │ Morrill          │   ← fire name (marquee-scrolls if long)
+│  3 🔥      │           642k ac│   ← upwind fire count + flame icon
+│            │ WNW         100% │   ← compass to fire (left), containment (right)
+│   W        │             287km│   ← distance to fire, right-justified
 │  (color)   │                  │
 └────────────┴──────────────────┘
 ```
 
-- **Big number:** count of active wildfires inside the configured radius.
-- **Tile color** (left tile background) encodes the worst threat present:
-  - **green** — zero active fires in range
-  - **yellow** — active fire(s) in range, but all distant or well-contained
-  - **orange** — ≥1 fire within 100 km and < 75% contained
-  - **dark red** — ≥1 large (≥ 500 ac) uncontained (< 50%) fire within 50 km
-- **Per-fire dots** in the right column, color-coded by containment:
-  - green = 100% contained, yellow = ≥ 50%, orange = 1–49%, red = 0% / unknown
-- **FIRES label** in navy on top of the count — same maximally-distinct color treatment as the Tor relay app's family label.
+When nothing is upwind:
 
-## Data source
+```
+┌────────────┬──────────────────┐
+│            │                  │
+│    0       │     ALL          │
+│            │    CLEAR         │
+│    W       │  (3 in range)    │   ← total active fires in range (for context)
+│  (green)   │                  │
+└────────────┴──────────────────┘
+```
+
+- **Big tile:** number of *upwind* fires (top) and the wind source compass at your location (bottom). Threat-colored background — green when zero, otherwise the worst threat among the upwind set.
+- **Threat color** (left tile background):
+  - **green** — no fires upwind
+  - **yellow** — upwind fire(s) present but distant or well-contained
+  - **orange** — nearest upwind fire is within 100 km and < 75% contained
+  - **dark red** — nearest upwind fire is large (≥ 500 ac), uncontained (< 50%), and within 50 km
+- **Right column** when an upwind fire is present (4 rows): name in navy (marquees if long), size with `ac` suffix and `k`/`M` magnitude prefix, compass-to-fire + containment %, and distance in km.
+
+## Data sources
+
+Two endpoints, both free and unauthenticated:
 
 ```
 GET https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/
@@ -33,12 +48,16 @@ GET https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/
     ?geometry={lon},{lat}&geometryType=esriGeometryPoint&inSR=4326
     &distance={radius_km}&units=esriSRUnit_Kilometer
     &where=IncidentTypeCategory='WF'
-    &outFields=IncidentName,FireDiscoveryDateTime,IncidentSize,PercentContained,POOState,POOCounty
-    &returnGeometry=true&f=json&resultRecordCount=50
+    &outFields=IncidentName,IncidentSize,PercentContained,POOState,POOCounty
+    &returnGeometry=true&f=json&resultRecordCount=100
     &orderByFields=IncidentSize+DESC
+
+GET https://api.open-meteo.com/v1/forecast
+    ?latitude={lat}&longitude={lon}
+    &current=wind_direction_10m,wind_speed_10m
 ```
 
-NIFC's WFIGS layer refreshes every few minutes during active incidents. We poll every 10 minutes with a matching `ttl_seconds=600` HTTP cache.
+NIFC's WFIGS refreshes every few minutes; we poll every 10 minutes (`ttl_seconds=600`). Open-Meteo's surface wind is cached for 30 minutes (`ttl_seconds=1800`) since wind doesn't change minute-to-minute.
 
 ## Setup
 
@@ -86,8 +105,9 @@ NIFC's WFIGS layer refreshes every few minutes during active incidents. We poll 
 
 ## Notes and caveats
 
-- **US wildfires only.** WFIGS is the federal inter-agency layer. Canadian / Mexican fires don't appear.
+- **US wildfires only.** WFIGS is the federal inter-agency layer. Canadian / Mexican fires don't appear, even if their smoke is reaching you.
 - **WFIGS lag.** The feature service refreshes every few minutes for active incidents; reported fire size is typically the last reliable on-the-ground measure, not real-time.
-- **`PercentContained` can be null.** Brand-new fires often have no containment field yet — we treat null as "0%" (uncontained) for color purposes.
-- **Radius is straight-line distance.** Doesn't account for wind direction, terrain, or smoke transport. Smoke can travel hundreds of km even when the fire itself is far away.
-- **Dot row caps at 7.** Larger counts show a `+` after the seventh dot. If you live in a high-incidence region, raise the threat thresholds rather than try to fit more dots.
+- **`PercentContained` can be null.** Brand-new fires often have no containment field yet — we treat null as "?" in the display but ignore it for color logic (treat as 0%).
+- **Wind is surface (10 m).** Open-Meteo's `wind_direction_10m` is what the smoke at ground level should follow. Upper-level smoke transport can differ; if you see haze from a fire that the app says is downwind, that's why.
+- **Windward sector grows with distance.** At the defaults: 20° at 0 km, 35° at 100 km, 50° at 200 km, capped at 90° beyond ~470 km. Close fires need to be tightly aligned with the wind; distant fires get a wider sector because their plumes disperse laterally as they travel. See [design-notes.md](./design-notes.md) for the model and tuning constants.
+- **Wind direction filters before distance.** A 5 km fire to the south won't show as the "nearest upwind" if the wind is from the west — instead a 200 km western fire will. That's the design: smoke transport matters more than proximity.

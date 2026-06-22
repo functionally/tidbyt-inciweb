@@ -11,11 +11,9 @@ tidbyt_device_id: "YOUR-DEVICE-ID"
 tidbyt_installation_id: "inciweb"
 
 # Reference location for the wildfire search (decimal degrees).
-# Default: 766 S Martin St, Longmont, CO (same point as the AQ app).
-latitude:  "40.147796"
-longitude: "-105.088271"
+latitude:  "YOUR-LATITUDE-HERE"
+longitude: "YOUR-LONGITUDE-HERE"
 
-# Search radius in kilometers. 200 km covers the Front Range + adjacent
-# plains and foothills (Cameron Peak / East Troublesome reached us in
-# the 2020 fire season at ~80 km).
+# Search radius in kilometers. 200 km covers a generous regional sector;
+# tune for your geography and how much you care about distant smoke.
 radius_km: "200"
