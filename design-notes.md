@@ -189,6 +189,19 @@ Two upstream APIs, two cache windows:
 
 Push cadence: 10 minutes by default (`PUSH_INTERVAL_S=600`). During an active local event you could drop to 300 (5 min) for faster reaction; outside fire season the data barely changes. Wall-clock alignment isn't useful here since neither API has a fixed publication schedule.
 
+## Diagnostics
+
+Every render emits a structured trace via Starlark `print()` (Pixlet routes these to stderr; the container loop captures both streams into `podman logs`). Per-render lines:
+
+- `[fetch] GET <url> ttl=<seconds>` — every HTTP call before it goes out, with TTL.
+- `[fetch] WFIGS HTTP=<status> bytes=<n>` / `[fetch] WFIGS features=<n>` — feature service response.
+- `[fetch] Open-Meteo HTTP=<status> bytes=<n>` / `[fetch] wind dir=<deg> speed=<m/s>` — wind response and parsed values.
+- `[compute] wind_dir=<deg> compass=<NNE> all_fires=<n> upwind=<n>` — the windward filter's inputs and result count.
+- `[render] state=ALL_CLEAR fires_in_range=<n>` — when nothing is upwind.
+- `[render] nearest=<name> dist=<km>km bearing=<NNE> size=<acres> contained=<pct> threat_bg=<hex>` — when something is upwind; includes the chosen tile color so the threat-level decision is auditable from the log alone.
+
+Replay: `podman logs inciweb | grep -E '^\[(fetch|compute|render)\]'`, slice by the surrounding `[<iso-ts>] push ok` envelopes from the bash loop.
+
 ## Starlark gotchas (carried from sibling projects)
 
 - `%` operator has no precision specifier — no `%.4f`. Format manually.

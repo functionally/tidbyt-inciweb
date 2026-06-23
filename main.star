@@ -91,6 +91,7 @@ SIZE_CLASS_COLORS = [
 
 def fetch_fires(lat, lon, radius_km):
     if lat == None or lon == None:
+        print("[fetch] WFIGS SKIP (missing coords)")
         return None
     params = (
         "geometry=" + str(lon) + "," + str(lat) +
@@ -102,10 +103,15 @@ def fetch_fires(lat, lon, radius_km):
         "&returnGeometry=true&f=json&resultRecordCount=100" +
         "&orderByFields=IncidentSize+DESC"
     )
-    r = http.get(WFIGS_URL + "?" + params, ttl_seconds = WFIGS_TTL_S)
+    url = WFIGS_URL + "?" + params
+    print("[fetch] GET %s ttl=%d" % (url, WFIGS_TTL_S))
+    r = http.get(url, ttl_seconds = WFIGS_TTL_S)
+    print("[fetch] WFIGS HTTP=%d bytes=%d" % (r.status_code, len(r.body())))
     if r.status_code != 200:
         return None
-    return (r.json() or {}).get("features", [])
+    feats = (r.json() or {}).get("features", [])
+    print("[fetch] WFIGS features=%d" % len(feats))
+    return feats
 
 def fetch_wind(lat, lon):
     """Returns wind_direction_deg (the direction the wind is coming FROM,
@@ -116,12 +122,17 @@ def fetch_wind(lat, lon):
         "&longitude=" + str(lon) +
         "&current=wind_direction_10m,wind_speed_10m"
     )
+    print("[fetch] GET %s ttl=%d" % (url, WIND_TTL_S))
     r = http.get(url, ttl_seconds = WIND_TTL_S)
+    print("[fetch] Open-Meteo HTTP=%d bytes=%d" % (r.status_code, len(r.body())))
     if r.status_code != 200:
         return None
     body = r.json() or {}
     cur = body.get("current") or {}
-    return cur.get("wind_direction_10m")
+    wind_dir = cur.get("wind_direction_10m")
+    wind_speed = cur.get("wind_speed_10m")
+    print("[fetch] wind dir=%s speed=%s" % (wind_dir, wind_speed))
+    return wind_dir
 
 def _haversine_km(lat1, lon1, lat2, lon2):
     R = 6371.0
@@ -477,14 +488,27 @@ def main(config):
     upwind = _filter_upwind(all_fires, wind_dir)
     wind_compass = _compass(wind_dir)
 
+    print("[compute] wind_dir=%s compass=%s all_fires=%d upwind=%d" % (
+        wind_dir, wind_compass, len(all_fires), len(upwind),
+    ))
+
     if len(upwind) == 0:
         big = _big_tile(0, wind_compass, GREEN_BG, FG_BLACK)
         info_col = _clear_right_col(len(all_fires))
+        print("[render] state=ALL_CLEAR fires_in_range=%d" % len(all_fires))
     else:
         nearest = upwind[0]
         bg, fg = _threat(nearest)
         big = _big_tile(len(upwind), wind_compass, bg, fg)
         info_col = _fire_right_col(nearest)
+        print("[render] nearest=%s dist=%dkm bearing=%s size=%s contained=%s threat_bg=%s" % (
+            nearest["name"],
+            int(nearest["dist_km"] + 0.5),
+            _compass(nearest["bearing_deg"]),
+            nearest["size"],
+            nearest["contained"],
+            bg,
+        ))
 
     # Right panel cycles info -> map. Box-wrapping the info column gives
     # Animation a definite frame size to match the map view.
