@@ -65,16 +65,32 @@ COMPASS_16 = [
 INFO_FRAMES = 100
 MAP_FRAMES = 60
 
-# Centroid map sized to the right panel. The crosshair marks the
-# configured location; pixel scale is radius_km / MAP_HALF_PX (~13 km/px
-# at the 200 km default), so fires that land on the same cell collide and
-# the larger one wins.
+# Centroid map sized to the right panel. The map's true geometric
+# center is between pixels because both MAP_W and MAP_H are even, so
+# we project around the floating-point midpoint (MAP_CX_F, MAP_CY_F)
+# and draw the crosshair as a 2 x 2 center block plus 2-wide arms —
+# that way the crosshair straddles the true center symmetrically
+# instead of sitting half a pixel off in one corner.
 MAP_W = 36
 MAP_H = 32
-MAP_CX = 17
-MAP_CY = 15
+MAP_CX_F = (MAP_W - 1) / 2.0  # 17.5
+MAP_CY_F = (MAP_H - 1) / 2.0  # 15.5
 MAP_HALF_PX = 15
 CROSSHAIR_COLOR = "#006688"
+
+# Chunky crosshair: 2 x 2 center block at pixels (17,15)..(18,16) plus
+# 2-wide arms extending 1 pixel in each cardinal direction. 12 pixels
+# total. Symmetric around the map's true (17.5, 15.5) center.
+CROSSHAIR_PIXELS = [
+    # Center 2 x 2 + horizontal arms (a 4-wide × 2-tall bar)
+    (16, 15), (16, 16),
+    (17, 15), (17, 16),
+    (18, 15), (18, 16),
+    (19, 15), (19, 16),
+    # Vertical arms above and below the center block
+    (17, 14), (18, 14),
+    (17, 17), (18, 17),
+]
 
 # NWCG size classes A-G folded to 6 colors: A+B (<10 ac) share one dim
 # swatch since they sit below the smoke-impact threshold at this zoom;
@@ -309,9 +325,11 @@ def _fire_icon():
     )
 
 def _big_tile(count, wind_compass, bg, fg):
-    """Left tile: upwind fire count in 6x13 with a pixel-art flame icon
-    appended, wind source compass at the local site in tb-8 below.
-    Background colored by threat level (green when count==0)."""
+    """Left tile: total fires-in-range count in 6x13 with a pixel-art
+    flame icon appended, wind source compass below. The number matches
+    what a user would tally by counting dots on the map frame. The
+    background color encodes upwind threat level — green when nothing
+    is blowing this way (regardless of how many fires are in range)."""
     return render.Box(
         width = 28,
         height = 32,
@@ -360,10 +378,11 @@ def _fire_right_col(fire):
         ),
     )
 
-def _clear_right_col(total_fires):
-    """Right column when nothing upwind. Quiet 'ALL CLEAR' with a small
-    parenthetical noting the total fires in range (which might still be
-    nonzero — they just aren't sending smoke this way)."""
+def _clear_right_col():
+    """Right column when nothing upwind. The big tile is already green
+    and shows the in-range count, so this column is reduced to a single
+    muted '—' centered — a subtle 'no threat' marker without the visual
+    weight of the old 'ALL CLEAR' headline."""
     return render.Padding(
         pad = (2, 0, 2, 0),
         child = render.Column(
@@ -371,9 +390,7 @@ def _clear_right_col(total_fires):
             main_align = "center",
             cross_align = "center",
             children = [
-                render.Text("ALL", color = FG_WHITE, font = "tb-8"),
-                render.Text("CLEAR", color = FG_WHITE, font = "tb-8"),
-                render.Text("(" + str(total_fires) + " in range)", color = "#888888", font = "tom-thumb"),
+                render.Text("—", color = "#666666", font = "6x13"),
             ],
         ),
     )
@@ -401,13 +418,15 @@ def _size_class_idx(acres):
 
 def _project(flat, flon, ref_lat, ref_lon, km_per_px):
     """Equirectangular projection. At <=300 km it differs from great-
-    circle by well under one pixel, so the simple form is fine."""
+    circle by well under one pixel, so the simple form is fine.
+    Reference is the panel's floating-point geometric midpoint so
+    fires are placed symmetrically around the visual crosshair."""
     lat_rad = ref_lat * math.pi / 180.0
     dx_km = (flon - ref_lon) * 111.32 * math.cos(lat_rad)
     dy_km = (flat - ref_lat) * 110.574
     return (
-        MAP_CX + _round_signed(dx_km / km_per_px),
-        MAP_CY - _round_signed(dy_km / km_per_px),
+        _round_signed(MAP_CX_F + dx_km / km_per_px),
+        _round_signed(MAP_CY_F - dy_km / km_per_px),
     )
 
 def _map_right_col(fires, ref_lat, ref_lon, radius_km):
@@ -428,9 +447,7 @@ def _map_right_col(fires, ref_lat, ref_lon, radius_km):
             cells[key] = cls
 
     children = []
-    for arm in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)]:
-        cxp = MAP_CX + arm[0]
-        cyp = MAP_CY + arm[1]
+    for cxp, cyp in CROSSHAIR_PIXELS:
         if (cxp, cyp) in cells:
             continue
         children.append(render.Padding(
@@ -493,13 +510,13 @@ def main(config):
     ))
 
     if len(upwind) == 0:
-        big = _big_tile(0, wind_compass, GREEN_BG, FG_BLACK)
-        info_col = _clear_right_col(len(all_fires))
+        big = _big_tile(len(all_fires), wind_compass, GREEN_BG, FG_BLACK)
+        info_col = _clear_right_col()
         print("[render] state=ALL_CLEAR fires_in_range=%d" % len(all_fires))
     else:
         nearest = upwind[0]
         bg, fg = _threat(nearest)
-        big = _big_tile(len(upwind), wind_compass, bg, fg)
+        big = _big_tile(len(all_fires), wind_compass, bg, fg)
         info_col = _fire_right_col(nearest)
         print("[render] nearest=%s dist=%dkm bearing=%s size=%s contained=%s threat_bg=%s" % (
             nearest["name"],

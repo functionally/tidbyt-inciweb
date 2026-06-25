@@ -48,13 +48,13 @@ Notes on the fields:
 
 ## Layout
 
-64 × 32 RGB pixels. Same two-tile structure as the sibling apps. The display is **upwind-only** — it shows the nearest fire whose bearing is within ±45° of where the wind is currently coming from. Fires downwind don't appear regardless of size or distance, because they aren't sending smoke this way.
+64 × 32 RGB pixels. Same two-tile structure as the sibling apps. The display is **upwind-prioritized** — the tile *color* and the right-column *fire details* both focus on the nearest upwind fire (bearing within the distance-scaled windward sector), so a calm green tile means "nothing is currently blowing smoke this way." The tile *number* and the map frame, by contrast, show every fire in the configured radius — that's the situational awareness layer that lets a user count nearby fires at a glance and match the tile number to the dot count on the map.
 
-### Why upwind-only
+### Why the threat color is upwind-only
 
-The earlier iteration showed every fire in range with a dot per fire. Spatial truth: at any given moment, almost all of those fires aren't relevant to *your* air. A 600 k acre contained fire 290 km downwind is interesting but irrelevant. A 5 k acre uncontained fire 80 km upwind is the one you care about.
+The earlier iteration colored the tile by the worst fire in range regardless of bearing. Spatial truth: at any given moment, almost all of those fires aren't relevant to *your* air. A 600 k acre contained fire 290 km downwind is interesting but irrelevant. A 5 k acre uncontained fire 80 km upwind is the one you care about.
 
-Filtering to the windward sector (±45° of the wind's source direction) cuts the display to "fires whose smoke is heading my way." Distance among those tells you how soon.
+Filtering to the windward sector (distance-scaled, ±20° at 0 km growing to ±90° at 500 km — see "Plume widening" below) cuts the *threat* signal down to "fires whose smoke is heading my way." Distance among those tells you how soon. The map frame still plots every fire in radius so the all-around situational picture isn't lost — just demoted out of the at-a-glance threat color.
 
 ### Layout — upwind fire present
 
@@ -69,7 +69,7 @@ Filtering to the windward sector (±45° of the wind's source direction) cuts th
   28×32 left      34×32 right (incl. 2 px pad)
 ```
 
-- Big tile, top: number of *upwind* fires in `6x13` font, with a 5×7 pixel-art flame appended (same flame the sibling AQ app uses for its smoke badge — keeps the visual vocabulary consistent across devices). 2 px of horizontal padding between the count and the icon.
+- Big tile, top: number of fires *in range* (regardless of bearing) in `6x13` font, with a 5×7 pixel-art flame appended (same flame the sibling AQ app uses for its smoke badge — keeps the visual vocabulary consistent across devices). 2 px of horizontal padding between the count and the icon. The number is deliberately the *all-in-radius* tally, not the upwind subset, so a user who counts dots on the map frame gets the same number. The tile *color* still encodes upwind threat — green when nothing is blowing this way, yellow / orange / dark red as the nearest upwind fire's threat tier rises — so a green tile with "5" reads as "5 fires nearby, none blowing my way" and a red "5" reads as "5 nearby, at least one is a real upwind threat".
 - Big tile, bottom: wind source compass at the local site in `6x13` (was `tb-8`; switched up for cleaner N/W/E/S glyphs at LED resolution).
 - Background = threat color (green / yellow / orange / dark red).
 - Right column, 4 rows in `tom-thumb`:
@@ -85,15 +85,15 @@ Row 3 lays the fire's compass next to its containment so the reader sees *which 
 ```
 ┌────────────┬─────────────────────────────────┐
 │            │                                 │
-│    0       │           ALL                   │
-│            │          CLEAR                  │
-│    W       │      (3 in range)               │
+│    3       │              —                  │
+│            │                                 │
+│    W       │                                 │
 │  (green)   │                                 │
 └────────────┴─────────────────────────────────┘
 ```
 
-- Big tile keeps the same shape as the active case — `0` on top, wind compass on bottom, green background. That way the structure of the display doesn't visibly reshuffle when the threat clears, only the colors and right-column content change.
-- Right column shows `ALL CLEAR` and a small parenthetical with the total fires *in range* (regardless of bearing). The right column color shows you that the wind-filter is what gave you the all-clear, not necessarily a global quiet.
+- Big tile keeps the same shape as the active case — count on top (now `len(all_fires)`, so `3` here even though none are upwind), wind compass on bottom, green background. The structure of the display doesn't visibly reshuffle when the threat clears, only the colors and right-column content change.
+- Right column is reduced to a single muted `—` in `6x13` `#666666`, centered — a subtle "no upwind threat" marker. The tile already conveys the count and the wind direction, so a prominent `ALL CLEAR` headline would just repeat what the tile is showing.
 
 ### Threat-level thresholds (and why)
 
@@ -126,11 +126,42 @@ When an upwind fire is present (4 rows):
 3. Direction-to-fire (left) + containment % (right).
 4. Distance + `km`, right-justified.
 
-When clear (3 rows):
+When clear (1 row):
 
-1. `ALL` in `tb-8`, centered.
-2. `CLEAR` in `tb-8`, centered.
-3. `(N in range)` in muted grey `#888888`, centered. `N` is the count of fires in range regardless of bearing.
+1. Muted `—` in `6x13` `#666666`, centered — single character, no `ALL CLEAR` headline. The big tile's number already carries the in-range count, so the right column only needs to whisper "nothing's blowing this way".
+
+### Map frame (36×32) — second half of the right-column animation
+
+The right column alternates between the info view above (≈5 s, `INFO_FRAMES = 100`) and a centroid map (≈3 s, `MAP_FRAMES = 60`). The map shows **every fire in range** (not just the upwind subset), so the number on the big tile matches the dot count on the map exactly.
+
+```
+┌─────────────────────────────────┐
+│                              ·  │  ← pink: G-class megafire upper-right
+│                                 │
+│              ┼┼                 │  ← chunky cyan "+" = configured location
+│              ┼┼                 │
+│       ·                         │  ← orange: smaller fire lower-left
+└─────────────────────────────────┘
+```
+
+Geometry:
+
+- Both `MAP_W = 36` and `MAP_H = 32` are even, so the true geometric center is *between* pixels at `(17.5, 15.5)`. The projection uses `MAP_CX_F = 17.5` and `MAP_CY_F = 15.5` as the floating-point reference, then rounds; fire dots therefore sit symmetrically around the visual midpoint regardless of whether they fall just east or just west of it.
+- The crosshair is drawn from a fixed `CROSSHAIR_PIXELS` list — a 2 × 2 center block at pixels `(17, 15)..(18, 16)` plus 2-wide arms extending one pixel in each cardinal direction. 12 pixels total, in dim cyan `#006688`. We use a 2 × 2 center (not a single pixel) so the cross straddles the true center on both axes; a single-pixel center can't sit on `(17.5, 15.5)` and ends up looking visibly upper-left of center at this size.
+- A fire dot at the same pixel as a crosshair pixel wins — the crosshair is an orientation aid, not the primary signal.
+
+Projection is equirectangular (`dx_km = (lon - ref_lon) * 111.32 * cos(ref_lat)`, `dy_km = (lat - ref_lat) * 110.574`), which differs from the great-circle distance by well under one pixel at the 300 km default radius. `km_per_px = radius_km / MAP_HALF_PX` with `MAP_HALF_PX = 15`, so at 200 km that's ~13 km/px and at 300 km ~20 km/px.
+
+Color is by **NWCG size class A-G**, folded into six punchy LED-friendly colors. The index doubles as the bigger-wins rank for pixel-collision resolution: when two fires project to the same cell, the larger one's color survives.
+
+| Class | Acres | Color | Hex |
+| --- | --- | --- | --- |
+| A/B | < 10 | dim grey | `#555555` |
+| C | 10–99 | yellow | `#FFFF00` |
+| D | 100–299 | orange | `#FFAA00` |
+| E | 300–999 | red-orange | `#FF6600` |
+| F | 1k–5k | bright red | `#FF0000` |
+| G | 5k+ (megafire) | magenta | `#FF00FF` |
 
 ## Bearing and "roughly upwind" math
 
