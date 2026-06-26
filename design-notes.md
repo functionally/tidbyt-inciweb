@@ -136,19 +136,21 @@ The right column alternates between the info view above (≈5 s, `INFO_FRAMES = 
 
 ```
 ┌─────────────────────────────────┐
-│                              ·  │  ← pink: G-class megafire upper-right
-│                                 │
-│              ┼┼                 │  ← chunky cyan "+" = configured location
-│              ┼┼                 │
-│       ·                         │  ← orange: smaller fire lower-left
+│░░░                           ·  │  ← faint cyan-gray wedge: upwind sector
+│░░░░░░░░                         │     (NE wind in this example, flaring out
+│░░░░░░░░░░░░░░░░░░░░░░░          │      with distance)
+│           ░░░░░░░░██░░░░░░░░░░░░│  ← cyan 2×2 anchor: configured location
+│░░░░░░░░░░░░░░░░░░██░░░░░░░░░░░░░│
+│       ·             ░░░░░░░░░░░░│  ← orange: smaller fire lower-left
 └─────────────────────────────────┘
 ```
 
 Geometry:
 
 - Both `MAP_W = 36` and `MAP_H = 32` are even, so the true geometric center is *between* pixels at `(17.5, 15.5)`. The projection uses `MAP_CX_F = 17.5` and `MAP_CY_F = 15.5` as the floating-point reference, then rounds; fire dots therefore sit symmetrically around the visual midpoint regardless of whether they fall just east or just west of it.
-- The crosshair is drawn from a fixed `CROSSHAIR_PIXELS` list — a 2 × 2 center block at pixels `(17, 15)..(18, 16)` plus 2-wide arms extending one pixel in each cardinal direction. 12 pixels total, in dim cyan `#006688`. We use a 2 × 2 center (not a single pixel) so the cross straddles the true center on both axes; a single-pixel center can't sit on `(17.5, 15.5)` and ends up looking visibly upper-left of center at this size.
-- A fire dot at the same pixel as a crosshair pixel wins — the crosshair is an orientation aid, not the primary signal.
+- The **windward-sector wedge** is the same distance-scaled cone the `_filter_upwind` filter uses to decide which fires count as threats. `_wedge_pixels(wind_dir, km_per_px)` brute-force tests every one of the 36 × 32 = 1152 map pixels: for each, compute its bearing and distance from `(MAP_CX_F, MAP_CY_F)`, then check whether `_angular_diff(bearing, wind_dir) <= _upwind_tolerance_deg(distance)`. Because the tolerance grows linearly with distance (20° at the apex, capped at 90° by ~466 km), the wedge isn't a triangle — it's a flared *trumpet* that visually encodes the plume-widening physics. Rendered in `WEDGE_COLOR = "#16242E"` (very dim cyan-gray) underneath everything else.
+- The **anchor dot** is a 2 × 2 cyan block at `ANCHOR_PIXELS = [(17, 15), (18, 15), (17, 16), (18, 16)]` straddling the geometric center. It replaces the old chunky crosshair: the wedge already implies the apex by convergence, but a positive "you are here" marker is still legible on days when no fires are present or the wedge is narrow.
+- Z-order: wedge < anchor < fire dots. The anchor yields to fires that land at the same pixel; the wedge yields to both anchor and fires.
 
 Projection is equirectangular (`dx_km = (lon - ref_lon) * 111.32 * cos(ref_lat)`, `dy_km = (lat - ref_lat) * 110.574`), which differs from the great-circle distance by well under one pixel at the 300 km default radius. `km_per_px = radius_km / MAP_HALF_PX` with `MAP_HALF_PX = 15`, so at 200 km that's ~13 km/px and at 300 km ~20 km/px.
 
@@ -165,13 +167,17 @@ Color is by **NWCG size class A-G**, folded into six punchy LED-friendly colors.
 
 ## Bearing and "roughly upwind" math
 
-Wind direction at 10 m above ground (`wind_direction_10m`) is given in Open-Meteo's response as **the direction the wind is coming FROM**, in degrees. So:
+Wind direction is sourced from Open-Meteo at the **700 hPa pressure level** (~3 km AGL), not the 10 m surface, as **the direction the wind is coming FROM**, in degrees. So:
 
 - `0°` = wind from the north (blowing south)
 - `90°` = wind from the east (blowing west)
 - `270°` = wind from the west (blowing east)
 
 A fire is "upwind" if its bearing from us is in the same direction as the wind's source — i.e., we look toward the fire by looking in the same direction the wind is coming from. The app uses a **distance-dependent** tolerance, not a fixed ±45°.
+
+### Why 700 hPa, not 10 m surface
+
+The InciWeb app's job is predicting when smoke from a fire will hit us, and the relevant wind is the *transport* wind at the plume injection altitude — not the surface wind. Lofted smoke from any meaningful fire (≥ class C, 10+ acres) punches well above the boundary layer, then travels with mid-troposphere winds at ~700 hPa. On the Front Range the surface 10 m wind is dominated by orographic boundary-layer effects (morning katabatic drainage, afternoon upslope flow) that frequently disagree with where the smoke is actually coming from. Validated 2026-06-26 at the user's coordinates: surface read 62° (ENE upslope) while 700 hPa read 269° (W, the actual synoptic westerly transport that's been steering Front Range fire smoke all week). With surface winds the upwind filter flagged 1 fire; with 700 hPa it flagged 2, including a 200 km WNW fire whose smoke really was on its way. Surface 10 m would only be the right choice for a "ground-level smoke from a smoldering nearby small fire" indicator, which isn't this app's job.
 
 ### Plume widening — why tolerance grows with distance
 
@@ -216,7 +222,7 @@ The Pixlet `math` module provides `pi`, `sin`, `cos`, `atan2`, `asin`, `sqrt` �
 Two upstream APIs, two cache windows:
 
 - WFIGS: `http.get(url, ttl_seconds=600)` — refreshes every few minutes during active incidents; 10 min is plenty.
-- Open-Meteo wind: `http.get(url, ttl_seconds=1800)` — surface wind doesn't change minute-to-minute; 30 min cache reduces upstream calls by 3× vs WFIGS without losing meaningful resolution.
+- Open-Meteo wind (700 hPa): `http.get(url, ttl_seconds=1800)` — upper-air wind direction shifts slowly compared to the surface; 30 min cache reduces upstream calls by 3× vs WFIGS without losing meaningful resolution.
 
 Push cadence: 10 minutes by default (`PUSH_INTERVAL_S=600`). During an active local event you could drop to 300 (5 min) for faster reaction; outside fire season the data barely changes. Wall-clock alignment isn't useful here since neither API has a fixed publication schedule.
 
@@ -242,7 +248,7 @@ Replay: `podman logs inciweb | grep -E '^\[(fetch|compute|render)\]'`, slice by 
 ## Open questions / stretch ideas
 
 - **Acreage sparkline for the upwind fire.** WFIGS exposes a history per incident — could render a small line chart under the right column showing whether *that specific fire* is growing or shrinking over the last 24 h.
-- **Multi-level winds.** 10 m surface wind drives ground-level smoke; 700 mb / 500 mb winds steer the smoke plume aloft. The app uses surface only; on days with significant directional shear (chinook, frontal passage) upper-level smoke can come from a different direction than the surface wind suggests.
+- ~~**Multi-level winds.**~~ **Resolved 2026-06-26.** Switched from 10 m surface to 700 hPa (~3 km AGL) — see "Why 700 hPa, not 10 m surface" above. A future enhancement could blend: surface for fires within ~20 km (where ground-level smoke from a smouldering source matters), 700 hPa beyond (where lofted-plume transport dominates). Not worth the complexity yet — 700 hPa alone matches the app's threat tier well.
 - **Smoke layer overlay.** NOAA HMS produces smoke polygons. Could downgrade the tile to yellow even when no fires are upwind, if smoke is overhead from an out-of-region source.
 - **Wind speed as a signal.** Calm winds (< 2 m/s) mean smoke barely transports — the "upwind" filter is misleading because nothing is upwind in any meaningful sense. Could grey the tile under calm conditions.
 - **Multi-region support.** The threat thresholds are tuned for Front Range; an `imperial` flag could swap km for miles, but the geographic semantics are the harder part.

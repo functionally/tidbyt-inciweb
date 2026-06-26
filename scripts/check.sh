@@ -24,8 +24,8 @@ red()   { printf "\033[31m%s\033[0m" "$1"; }
 ok()    { printf "  $(green '✓') %s\n" "$1"; }
 warn()  { printf "  $(red '✗') %s\n" "$1"; }
 
-echo "== Wind direction at (${LAT}, ${LON}) — Open-Meteo =="
-WIND_URL="https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}&current=wind_direction_10m,wind_speed_10m"
+echo "== Wind at 700 hPa (~3 km AGL) at (${LAT}, ${LON}) — Open-Meteo =="
+WIND_URL="https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}&current=wind_direction_700hPa,wind_speed_700hPa,wind_direction_10m"
 WIND_RESP=$(curl -sL --max-time 12 -w "\n%{http_code}" "$WIND_URL")
 WIND_CODE=$(printf '%s' "$WIND_RESP" | tail -n1)
 WIND_BODY=$(printf '%s' "$WIND_RESP" | sed '$d')
@@ -36,14 +36,21 @@ if [[ "$WIND_CODE" != "200" ]]; then
 fi
 ok "Open-Meteo OK"
 
-WIND_DEG=$(python3 -c "import json; d=json.loads('''${WIND_BODY}'''); print(d['current']['wind_direction_10m'])")
-WIND_SPEED=$(python3 -c "import json; d=json.loads('''${WIND_BODY}'''); print(d['current']['wind_speed_10m'])")
+WIND_DEG=$(python3 -c "import json; d=json.loads('''${WIND_BODY}'''); print(d['current']['wind_direction_700hPa'])")
+WIND_SPEED=$(python3 -c "import json; d=json.loads('''${WIND_BODY}'''); print(d['current']['wind_speed_700hPa'])")
+WIND_10M=$(python3 -c "import json; d=json.loads('''${WIND_BODY}'''); print(d['current']['wind_direction_10m'])")
 WIND_COMPASS=$(python3 -c "
 deg = ${WIND_DEG}
 labels = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW']
 print(labels[int((deg + 11.25) / 22.5) % 16])
 ")
-echo "  wind FROM ${WIND_COMPASS} (${WIND_DEG}°), ${WIND_SPEED} m/s"
+WIND_10M_COMPASS=$(python3 -c "
+deg = ${WIND_10M}
+labels = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW']
+print(labels[int((deg + 11.25) / 22.5) % 16])
+")
+echo "  700 hPa  wind FROM ${WIND_COMPASS} (${WIND_DEG}°), ${WIND_SPEED} km/h  ← used for upwind filter"
+echo "  surface  wind FROM ${WIND_10M_COMPASS} (${WIND_10M}°)  (informational; orographic / diurnal at this level)"
 
 echo
 echo "== WFIGS — active US wildfires within ${RADIUS} km of (${LAT}, ${LON}) =="

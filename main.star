@@ -76,20 +76,24 @@ MAP_H = 32
 MAP_CX_F = (MAP_W - 1) / 2.0  # 17.5
 MAP_CY_F = (MAP_H - 1) / 2.0  # 15.5
 MAP_HALF_PX = 15
-CROSSHAIR_COLOR = "#006688"
 
-# Chunky crosshair: 2 x 2 center block at pixels (17,15)..(18,16) plus
-# 2-wide arms extending 1 pixel in each cardinal direction. 12 pixels
-# total. Symmetric around the map's true (17.5, 15.5) center.
-CROSSHAIR_PIXELS = [
-    # Center 2 x 2 + horizontal arms (a 4-wide × 2-tall bar)
-    (16, 15), (16, 16),
-    (17, 15), (17, 16),
-    (18, 15), (18, 16),
-    (19, 15), (19, 16),
-    # Vertical arms above and below the center block
-    (17, 14), (18, 14),
-    (17, 17), (18, 17),
+# Map decoration: a faint trumpet-shaped wedge fills the windward sector
+# (apex at the map's geometric center, flaring with distance via
+# _upwind_tolerance_deg), and a small 2x2 anchor dot marks the
+# configured location. Replaces the old chunky-cross crosshair — the
+# wedge shows which fires are upwind without overlaying every map; the
+# anchor keeps a positive "you are here" marker so the location is
+# still legible when nothing is upwind.
+WEDGE_COLOR = "#16242E"  # very dim cyan-gray, distinct from black, won't compete with fire dots
+ANCHOR_COLOR = "#006688"  # same cyan the old crosshair used
+
+# Anchor dot: 2 x 2 block straddling the map's true (17.5, 15.5)
+# geometric center. Without it the wedge alone implies the apex by
+# convergence, but a positive "you are here" marker is more legible
+# (especially when no fires are present or the wedge is narrow).
+ANCHOR_PIXELS = [
+    (17, 15), (18, 15),
+    (17, 16), (18, 16),
 ]
 
 # NWCG size classes A-G folded to 6 colors: A+B (<10 ac) share one dim
@@ -131,12 +135,22 @@ def fetch_fires(lat, lon, radius_km):
 
 def fetch_wind(lat, lon):
     """Returns wind_direction_deg (the direction the wind is coming FROM,
-    Open-Meteo's convention; 0=N, 90=E, 180=S, 270=W) or None on error."""
+    Open-Meteo's convention; 0=N, 90=E, 180=S, 270=W) or None on error.
+
+    Uses 700 hPa (~3 km AGL) rather than 10 m surface wind. Lofted
+    smoke from a large fire follows mid-troposphere transport, not the
+    surface boundary layer — and on the Front Range the surface wind
+    is dominated by orographic upslope/drainage cycles that frequently
+    disagree with the actual smoke direction (the synoptic westerlies
+    that move fire plumes show up cleanly at 700 hPa but get masked at
+    the surface). Empirically verified 2026-06-26 at the user's
+    coordinates: surface read 62° (ENE upslope), 700 hPa read 269° (W
+    westerly — the real transport direction)."""
     url = (
         OPEN_METEO_URL +
         "?latitude=" + str(lat) +
         "&longitude=" + str(lon) +
-        "&current=wind_direction_10m,wind_speed_10m"
+        "&current=wind_direction_700hPa,wind_speed_700hPa"
     )
     print("[fetch] GET %s ttl=%d" % (url, WIND_TTL_S))
     r = http.get(url, ttl_seconds = WIND_TTL_S)
@@ -145,9 +159,9 @@ def fetch_wind(lat, lon):
         return None
     body = r.json() or {}
     cur = body.get("current") or {}
-    wind_dir = cur.get("wind_direction_10m")
-    wind_speed = cur.get("wind_speed_10m")
-    print("[fetch] wind dir=%s speed=%s" % (wind_dir, wind_speed))
+    wind_dir = cur.get("wind_direction_700hPa")
+    wind_speed = cur.get("wind_speed_700hPa")
+    print("[fetch] wind dir=%s speed=%s (700 hPa)" % (wind_dir, wind_speed))
     return wind_dir
 
 def _haversine_km(lat1, lon1, lat2, lon2):
@@ -420,7 +434,7 @@ def _project(flat, flon, ref_lat, ref_lon, km_per_px):
     """Equirectangular projection. At <=300 km it differs from great-
     circle by well under one pixel, so the simple form is fine.
     Reference is the panel's floating-point geometric midpoint so
-    fires are placed symmetrically around the visual crosshair."""
+    fires are placed symmetrically around the visual anchor dot."""
     lat_rad = ref_lat * math.pi / 180.0
     dx_km = (flon - ref_lon) * 111.32 * math.cos(lat_rad)
     dy_km = (flat - ref_lat) * 110.574
@@ -429,11 +443,35 @@ def _project(flat, flon, ref_lat, ref_lon, km_per_px):
         _round_signed(MAP_CY_F - dy_km / km_per_px),
     )
 
-def _map_right_col(fires, ref_lat, ref_lon, radius_km):
-    """Right-panel map: black background, dim cyan crosshair at the
-    configured location, one pixel per fire centroid colored by NWCG
-    size class. On pixel collisions the larger fire wins; the crosshair
-    yields to fire pixels at the same cell."""
+def _wedge_pixels(wind_dir, km_per_px):
+    """Map pixels inside the distance-dependent windward sector. Apex
+    at the map's geometric midpoint; the sector half-angle grows with
+    distance via _upwind_tolerance_deg (20 deg at the apex, capped at
+    90 deg by ~466 km), so the shape is a trumpet rather than a
+    triangle — the wedge visualizes the same plume-widening model the
+    upwind filter uses to pick which fires count as threats."""
+    rad_to_deg = 180.0 / math.pi
+    pixels = []
+    for py in range(MAP_H):
+        for px in range(MAP_W):
+            dx = float(px) - MAP_CX_F
+            dy = MAP_CY_F - float(py)
+            if dx == 0.0 and dy == 0.0:
+                continue
+            dist_km = math.sqrt(dx * dx + dy * dy) * km_per_px
+            bearing = math.atan2(dx, dy) * rad_to_deg
+            if bearing < 0:
+                bearing = bearing + 360
+            if _angular_diff(bearing, wind_dir) <= _upwind_tolerance_deg(dist_km):
+                pixels.append((px, py))
+    return pixels
+
+def _map_right_col(fires, ref_lat, ref_lon, radius_km, wind_dir):
+    """Right-panel map: black background, a faint cyan-gray wedge
+    showing the upwind sector, a 2x2 cyan anchor dot at the center,
+    and one pixel per fire centroid colored by NWCG size class. Fire
+    dots top everything else (largest wins on collision); the anchor
+    yields to fires; the wedge yields to both."""
     km_per_px = float(radius_km) / float(MAP_HALF_PX)
 
     cells = {}
@@ -446,15 +484,28 @@ def _map_right_col(fires, ref_lat, ref_lon, radius_km):
         if key not in cells or cls > cells[key]:
             cells[key] = cls
 
+    anchor_set = {p: True for p in ANCHOR_PIXELS}
+
     children = []
-    for cxp, cyp in CROSSHAIR_PIXELS:
-        if (cxp, cyp) in cells:
+    # Wedge first so anchor and fires draw on top.
+    for px, py in _wedge_pixels(wind_dir, km_per_px):
+        if (px, py) in cells or (px, py) in anchor_set:
             continue
         children.append(render.Padding(
-            pad = (cxp, cyp, 0, 0),
-            child = render.Box(width = 1, height = 1, color = CROSSHAIR_COLOR),
+            pad = (px, py, 0, 0),
+            child = render.Box(width = 1, height = 1, color = WEDGE_COLOR),
         ))
 
+    # Anchor next so fires can overdraw it where they land on top.
+    for px, py in ANCHOR_PIXELS:
+        if (px, py) in cells:
+            continue
+        children.append(render.Padding(
+            pad = (px, py, 0, 0),
+            child = render.Box(width = 1, height = 1, color = ANCHOR_COLOR),
+        ))
+
+    # Fire dots on top.
     for key, cls in cells.items():
         children.append(render.Padding(
             pad = (key[0], key[1], 0, 0),
@@ -530,7 +581,7 @@ def main(config):
     # Right panel cycles info -> map. Box-wrapping the info column gives
     # Animation a definite frame size to match the map view.
     info_view = render.Box(width = MAP_W, height = MAP_H, child = info_col)
-    map_view = _map_right_col(all_fires, lat, lon, radius)
+    map_view = _map_right_col(all_fires, lat, lon, radius, wind_dir)
     right_anim = render.Animation(
         children = [info_view] * INFO_FRAMES + [map_view] * MAP_FRAMES,
     )
